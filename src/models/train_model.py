@@ -3,10 +3,12 @@ import argparse
 import pandas as pd
 import numpy as np
 import joblib
+import sys
 import mlflow
 import mlflow.sklearn
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score
+from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
 import yaml
@@ -73,15 +75,54 @@ def train_and_evaluate_model(model, X_train, y_train, X_test, y_test):
     mae = mean_absolute_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
     rmse = np.sqrt(np.mean((y_test - y_pred) ** 2))
+    mape = mean_absolute_percentage_error(y_test, y_pred)   # error relativo: 0.05 = 5 %
+
+    # Baseline: predecir siempre la mediana de train. Un modelo que no le gana no sirve,
+    # por muy bueno que parezca el R².
+    baseline = DummyRegressor(strategy="median").fit(X_train, y_train)
+    baseline_mae = mean_absolute_error(y_test, baseline.predict(X_test))
 
     metrics = {
-        'mae': mae,
-        'r2': r2,
-        'rmse': rmse
+        'mae': float(mae),
+        'r2': float(r2),
+        'rmse': float(rmse),
+        'mape': float(mape),
+        'baseline_mae': float(baseline_mae),
     }
 
-    logger.info(f"Model performance - R²: {r2:.4f}, MAE: {mae:.2f}, RMSE: {rmse:.2f}")
+    logger.info(f"Model performance - R²: {r2:.4f}, MAE: {mae:.2f}, RMSE: {rmse:.2f}, "
+                f"MAPE: {mape:.4f} (baseline MAE {baseline_mae:.2f})")
     return model, metrics
+
+def check_quality_gate(metrics, config):
+    """Compara las métricas del holdout contra `model.quality_gate` del YAML.
+
+    Devuelve la lista de incumplimientos (vacía = pasa). Umbrales opcionales:
+      min_r2:             R² mínimo en el holdout
+      max_mape:           error porcentual máximo
+      must_beat_baseline: MAE debe ser menor que predecir la mediana
+    """
+    gate = config['model'].get('quality_gate', {}) or {}
+    failures = []
+    if 'min_r2' in gate and metrics['r2'] < gate['min_r2']:
+        failures.append(f"R² {metrics['r2']:.4f} < min_r2 {gate['min_r2']}")
+    if 'max_mape' in gate and metrics['mape'] > gate['max_mape']:
+        failures.append(f"MAPE {metrics['mape']:.4f} > max_mape {gate['max_mape']}")
+    if gate.get('must_beat_baseline', False) and metrics['mae'] >= metrics['baseline_mae']:
+        failures.append(f"MAE {metrics['mae']:.0f} no mejora el baseline (mediana) {metrics['baseline_mae']:.0f}")
+    return failures
+
+def log_failed_gate(config, metrics, failures, mlflow_tracking_uri):
+    """Deja constancia en MLflow del intento rechazado (sin registrar el modelo)."""
+    if not mlflow_tracking_uri:
+        return
+    mlflow.set_tracking_uri(mlflow_tracking_uri)
+    mlflow.set_experiment("House Price Prediction - Production")
+    with mlflow.start_run(run_name="quality_gate_failed"):
+        mlflow.log_params(config['model']['parameters'])
+        mlflow.log_metrics(metrics)
+        mlflow.set_tag("quality_gate", "failed")
+        mlflow.set_tag("quality_gate_failures", " | ".join(failures))
 
 def save_model_artifacts(model, config, metrics, models_dir):
     """Guarda modelo y artefactos."""
@@ -137,6 +178,10 @@ def register_model_in_mlflow(model, config, metrics, mlflow_tracking_uri, X_samp
         mlflow.log_param("total_features",
                         config['model']['feature_sets']['total_features'])
         mlflow.log_param("holdout", "split fijo 80/20 (random_state=42) de feature engineering")
+        gate = config['model'].get('quality_gate', {}) or {}
+        for k, v in gate.items():
+            mlflow.log_param(f"gate_{k}", v)
+        mlflow.set_tag("quality_gate", "passed")   # si llegó aquí, pasó el gate de main()
 
         # Registrar modelo con firma inferida de datos reales.
         # infer_signature(None, None) no es válido: necesita al menos inputs u outputs.
@@ -153,8 +198,10 @@ def register_model_in_mlflow(model, config, metrics, mlflow_tracking_uri, X_samp
             input_example=input_example,
         )
 
-        # Transicionar a producción si las métricas son buenas
-        if metrics['r2'] > 0.8:  # Threshold configurable
+        # Transicionar a producción: el umbral es el mismo min_r2 del quality gate
+        # (default 0.8 si el YAML no define gate)
+        min_r2 = (config['model'].get('quality_gate') or {}).get('min_r2', 0.8)
+        if metrics['r2'] >= min_r2:
             client = MlflowClient()
             model_version = client.get_latest_versions(model_name, stages=["None"])[0]
             client.transition_model_version_stage(
@@ -190,6 +237,19 @@ def main():
     trained_model, metrics = train_and_evaluate_model(
         model, X_train, y_train, X_test, y_test
     )
+
+    # Quality gate (reto lab 13.2): si el modelo no cumple los umbrales del YAML,
+    # NO se guarda ni se registra; el proceso termina con exit 1, el job de CI falla
+    # y build-and-publish no corre.
+    failures = check_quality_gate(metrics, config)
+    if failures:
+        for f in failures:
+            logger.error(f"❌ Quality gate: {f}")
+        log_failed_gate(config, metrics, failures, args.mlflow_tracking_uri)
+        logger.error("Model NOT saved or registered. Exiting with code 1.")
+        sys.exit(1)
+    gate = config['model'].get('quality_gate') or {}
+    logger.info(f"✅ Quality gate passed ({gate if gate else 'no thresholds defined'})")
 
     # Guardar artefactos localmente
     model_path, config_path = save_model_artifacts(
