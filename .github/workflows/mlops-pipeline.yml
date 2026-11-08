@@ -11,7 +11,7 @@ on:
 jobs:
   data-processing:
     name: Data Processing
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04               # ubuntu-latest ya es Ubuntu 26.04 y no tiene Python 3.11.9
 
     steps:
       - name: Checkout code
@@ -47,7 +47,7 @@ jobs:
   feature-engineering:
     name: Feature Engineering
     needs: data-processing
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04               # ubuntu-latest ya es Ubuntu 26.04 y no tiene Python 3.11.9
 
     steps:
       - name: Checkout code
